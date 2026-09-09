@@ -19,12 +19,13 @@ DEFAULT_INSERT_TIMEOUT_SECONDS = 120
 ZONE_CACHE_SECONDS = 600
 # Instance label that records the zone the VM landed in after zone fallback.
 ZONE_LABEL = 'gha-zone'
+# Instance label that records whether the VM runs as Spot or on demand (standard).
+PROVISIONING_LABEL = 'gha-provisioning'
 
 # Operation error codes that mean "this zone cannot serve the request right now".
 # https://cloud.google.com/compute/docs/troubleshooting/troubleshooting-vm-creation
 RETRY_ELSEWHERE_CODE_PREFIXES = (
     'ZONE_RESOURCE_POOL_EXHAUSTED',
-    'QUOTA_EXCEEDED',
 )
 # Message fragments that indicate a stockout even when the code is generic.
 RETRY_ELSEWHERE_MESSAGE_MARKERS = (
@@ -32,6 +33,21 @@ RETRY_ELSEWHERE_MESSAGE_MARKERS = (
     'does not have enough resources',
     'currently unavailable',
 )
+# Quota is regional (or project-wide), so another zone of the region cannot help.
+QUOTA_CODE_PREFIXES = (
+    'QUOTA_EXCEEDED',
+)
+QUOTA_MESSAGE_PATTERN = re.compile(r"quota '[^']+' exceeded|quota_exceeded", re.IGNORECASE)
+# Errors the insert call itself raises when a zone does not offer the machine type (or the
+# template's disk type): skip that zone, the others of the region may offer it.
+ZONE_UNSUPPORTED_MESSAGE_MARKERS = (
+    'does not exist in zone',
+    'not available in zone',
+    'is not supported in zone',
+    'not supported in this zone',
+)
+# Set GCE_SPOT_FALLBACK_STANDARD=false to never fall back from Spot to on-demand VMs.
+SPOT_FALLBACK_ENV = 'GCE_SPOT_FALLBACK_STANDARD'
 
 
 class InstanceCreationError(Exception):
@@ -39,12 +55,70 @@ class InstanceCreationError(Exception):
 
 
 class ZoneCapacityError(InstanceCreationError):
-    """The insert failed for a capacity reason (stockout/quota); another zone may work."""
+    """The zone cannot serve the request (stockout, or it lacks the machine type); another zone may."""
 
     def __init__(self, message, code=None, zone=None):
         super().__init__(message)
         self.code = code
         self.zone = zone
+
+
+class QuotaExceededError(InstanceCreationError):
+    """The project or region is out of quota. No other zone or provisioning model can help."""
+
+
+def is_quota_error(errors):
+    """True when any error of a finished Compute operation is a quota error."""
+    for error in errors or []:
+        code = str(getattr(error, 'code', '') or '')
+        message = str(getattr(error, 'message', '') or '')
+        if code.startswith(QUOTA_CODE_PREFIXES) or QUOTA_MESSAGE_PATTERN.search(message):
+            return True
+    return False
+
+
+def classify_call_error(exception):
+    """
+    Classify an exception raised by the insert call itself (before any operation exists).
+
+    Returns:
+        str: 'quota', 'capacity' (stockout or the zone lacks the machine type) or 'fatal'.
+    """
+    text = str(exception)
+    lowered = text.lower()
+    if 'QUOTA_EXCEEDED' in text or QUOTA_MESSAGE_PATTERN.search(text):
+        return 'quota'
+    if any(prefix in text for prefix in RETRY_ELSEWHERE_CODE_PREFIXES) \
+            or any(marker in lowered for marker in RETRY_ELSEWHERE_MESSAGE_MARKERS) \
+            or any(marker in lowered for marker in ZONE_UNSUPPORTED_MESSAGE_MARKERS):
+        return 'capacity'
+    return 'fatal'
+
+
+def is_spot(template):
+    """True when an instance template provisions Spot VMs."""
+    try:
+        model = template.properties.scheduling.provisioning_model
+    except AttributeError:
+        return False
+    return isinstance(model, str) and model.upper() == 'SPOT'
+
+
+def standard_scheduling(template):
+    """
+    The template's scheduling with the provisioning model switched from Spot to on-demand.
+
+    The whole scheduling block is copied so every other setting (max run duration, host
+    maintenance) is kept; the instance's scheduling replaces the template's on insert.
+    The termination action is kept only with a max run duration, its only use on demand.
+    """
+    source = template.properties.scheduling
+    scheduling = compute_v1.Scheduling.deserialize(compute_v1.Scheduling.serialize(source))
+    scheduling.provisioning_model = 'STANDARD'
+    scheduling.preemptible = False
+    if 'max_run_duration' not in scheduling and 'instance_termination_action' in scheduling:
+        del scheduling.instance_termination_action
+    return scheduling
 
 
 def classify_operation_errors(errors):
@@ -56,6 +130,7 @@ def classify_operation_errors(errors):
 
     Returns:
         tuple(bool, str): (retry_elsewhere, human readable summary "CODE: message; ...").
+        Quota errors are not retry_elsewhere: see is_quota_error.
     """
     retry_elsewhere = False
     parts = []
@@ -76,6 +151,8 @@ def classify_operation_errors(errors):
             summary += f", zone={zone})" if zone else ")"
         parts.append(summary)
         haystack = f"{message} {reason}".lower()
+        if is_quota_error([error]):
+            continue
         if code.startswith(RETRY_ELSEWHERE_CODE_PREFIXES) or reason.lower() == 'stockout' \
                 or any(marker in haystack for marker in RETRY_ELSEWHERE_MESSAGE_MARKERS):
             retry_elsewhere = True
@@ -261,50 +338,35 @@ class GCloudClient:
         ]
         instance_resource.metadata = metadata
 
-        # Try the configured zone first, then the other zones of the region (templates are
-        # regional). Only capacity errors move on to the next zone; anything else fails at once.
-        zones = self.candidate_zones()
-        capacity_failures = []
-        for zone in zones:
-            labels[ZONE_LABEL] = zone
-            instance_resource.labels = dict(labels)
-            # https://docs.cloud.google.com/python/docs/reference/compute/latest/google.cloud.compute_v1.types.InsertInstanceRequest
-            request = compute_v1.InsertInstanceRequest(
-                project=self.project_id,
-                zone=zone,
-                instance_resource=instance_resource,
-                source_instance_template=instance_template_resource.self_link
-            )
-            try:
-                # https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/insert
-                operation = self.instance_client.insert(request=request)
-                logger.info(
-                    "Instance creation operation started: %s, zone: %s, delivery_id: %s",
-                    operation.name,
-                    zone,
-                    delivery_id,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to create instance %s in zone %s: %s, delivery_id: %s",
-                    instance_name,
-                    zone,
-                    e,
-                    delivery_id,
-                )
-                raise
+        # Spot templates get a second rung: the same zones again as on-demand VMs, so a Spot
+        # stockout across the region still yields a runner.
+        rungs = [('spot' if is_spot(instance_template_resource) else 'standard', None)]
+        if rungs[0][0] == 'spot' and os.environ.get(SPOT_FALLBACK_ENV, 'true').lower() != 'false':
+            rungs.append(('standard', standard_scheduling(instance_template_resource)))
 
-            # Wait for the operation: capacity errors (stockout, quota) are operation-level
-            # errors, so returning here would report success for a VM that never existed.
+        capacity_failures = []
+        for provisioning, scheduling in rungs:
+            if scheduling is not None:
+                logger.warning(
+                    "No zone in region %s has Spot capacity for %s; trying on-demand, delivery_id: %s",
+                    self.region,
+                    instance_name,
+                    delivery_id,
+                )
+                instance_resource.scheduling = scheduling
+            labels[PROVISIONING_LABEL] = provisioning
             try:
-                self._wait_for_insert(operation, instance_name, zone, delivery_id=delivery_id)
+                zone = self._insert_across_zones(
+                    instance_resource, instance_template_resource, labels, instance_name, delivery_id
+                )
             except ZoneCapacityError as e:
-                capacity_failures.append(e)
+                capacity_failures.extend(getattr(e, 'failures', [e]))
                 continue
             logger.info(
-                "Instance %s created in zone %s with template %s, delivery_id: %s",
+                "Instance %s created in zone %s (%s) with template %s, delivery_id: %s",
                 instance_name,
                 zone,
+                provisioning,
                 instance_template_resource.name,
                 delivery_id,
             )
@@ -325,12 +387,91 @@ class GCloudClient:
             zone=last.zone,
         ) from last
 
+    def _insert_across_zones(self, instance_resource, template, labels, instance_name, delivery_id=None):
+        """
+        Insert the instance in the configured zone, then in the region's other zones.
+
+        Templates are regional, so every zone of the region is a valid target. A zone that is
+        out of capacity, or does not offer the machine type, moves on to the next zone. Quota
+        and every other error fail at once.
+
+        Returns:
+            str: the zone the instance was created in.
+
+        Raises:
+            ZoneCapacityError: no zone could serve the request; ``failures`` lists each zone's.
+            QuotaExceededError: out of quota; no zone was tried after it.
+            InstanceCreationError / Exception: any other failure.
+        """
+        failures = []
+        for zone in self.candidate_zones():
+            labels[ZONE_LABEL] = zone
+            instance_resource.labels = dict(labels)
+            # https://docs.cloud.google.com/python/docs/reference/compute/latest/google.cloud.compute_v1.types.InsertInstanceRequest
+            request = compute_v1.InsertInstanceRequest(
+                project=self.project_id,
+                zone=zone,
+                instance_resource=instance_resource,
+                source_instance_template=template.self_link
+            )
+            try:
+                # https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/insert
+                operation = self.instance_client.insert(request=request)
+                logger.info(
+                    "Instance creation operation started: %s, zone: %s, delivery_id: %s",
+                    operation.name,
+                    zone,
+                    delivery_id,
+                )
+            except Exception as e:
+                kind = classify_call_error(e)
+                if kind == 'capacity':
+                    logger.warning(
+                        "Zone %s cannot create instance %s: %s, delivery_id: %s",
+                        zone,
+                        instance_name,
+                        e,
+                        delivery_id,
+                    )
+                    failures.append(ZoneCapacityError(str(e), code=type(e).__name__, zone=zone))
+                    continue
+                logger.error(
+                    "Failed to create instance %s in zone %s: %s, delivery_id: %s",
+                    instance_name,
+                    zone,
+                    e,
+                    delivery_id,
+                )
+                if kind == 'quota':
+                    raise QuotaExceededError(
+                        f"Out of quota creating {instance_name} in region {self.region}: {e}"
+                    ) from e
+                raise
+
+            # Wait for the operation: capacity errors (stockout, quota) are operation-level
+            # errors, so returning here would report success for a VM that never existed.
+            try:
+                self._wait_for_insert(operation, instance_name, zone, delivery_id=delivery_id)
+            except ZoneCapacityError as e:
+                failures.append(e)
+                continue
+            return zone
+
+        error = ZoneCapacityError(
+            f"No zone in region {self.region} could create {instance_name}",
+            code=failures[-1].code if failures else None,
+            zone=failures[-1].zone if failures else None,
+        )
+        error.failures = failures
+        raise error
+
     def _wait_for_insert(self, operation, instance_name, zone, delivery_id=None):
         """
         Block until the insert operation finishes and raise if it did not succeed.
 
         Raises:
-            ZoneCapacityError: the zone is out of capacity/quota; another zone may work.
+            ZoneCapacityError: the zone is out of capacity; another zone may work.
+            QuotaExceededError: out of quota; no other zone can help.
             InstanceCreationError: any other failure, including a timed-out wait.
         """
         try:
@@ -349,6 +490,17 @@ class GCloudClient:
             if not summary:
                 summary = str(e)
             code = str(getattr(errors[0], 'code', '') or '') if errors else ''
+            if is_quota_error(errors):
+                logger.error(
+                    "Instance creation for %s in zone %s is out of quota: %s, delivery_id: %s",
+                    instance_name,
+                    zone,
+                    summary,
+                    delivery_id,
+                )
+                raise QuotaExceededError(
+                    f"Out of quota creating {instance_name} in zone {zone}: {summary}"
+                ) from e
             if retry_elsewhere:
                 logger.warning(
                     "Instance creation for %s in zone %s failed with a capacity error: %s, delivery_id: %s",

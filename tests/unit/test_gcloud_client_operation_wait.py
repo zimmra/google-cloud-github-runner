@@ -182,7 +182,6 @@ class TestClassifyOperationErrors:
     @pytest.mark.parametrize('code,message', [
         ('ZONE_RESOURCE_POOL_EXHAUSTED', 'The zone does not have enough resources'),
         ('ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS', 'The zone does not have enough resources'),
-        ('QUOTA_EXCEEDED', "Quota 'N4_CPUS' exceeded"),
         ('RESOURCE_UNAVAILABLE', 'A n4-standard-16 VM instance is currently unavailable in the us-central1-b zone'),
         ('UNKNOWN', 'reason: stockout'),
     ])
@@ -191,6 +190,14 @@ class TestClassifyOperationErrors:
         retry_elsewhere, summary = classify_operation_errors(errors)
         assert retry_elsewhere is True
         assert code in summary
+
+    def test_quota_is_not_retry_elsewhere(self):
+        # Quota is regional: another zone of the region cannot help, so it is its own class.
+        errors = [compute_v1.Errors(code='QUOTA_EXCEEDED', message="Quota 'N4_CPUS' exceeded")]
+        retry_elsewhere, summary = classify_operation_errors(errors)
+        assert retry_elsewhere is False
+        assert 'QUOTA_EXCEEDED' in summary
+        assert gcloud_client.is_quota_error(errors) is True
 
     @pytest.mark.parametrize('code,message', [
         ('INVALID_FIELD_VALUE', "Invalid value for field 'resource.name'"),
