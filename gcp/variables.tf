@@ -116,7 +116,7 @@ variable "github_runners_spot_fallback_standard" {
 
 # Create runner VMs in the background so the webhook answers GitHub within its 10 second timeout
 variable "github_runners_manager_async_provisioning" {
-  description = "Answer the webhook at once and create runner VMs in the background (keeps the manager's CPU allocated outside requests, which Cloud Run bills as instance-based)"
+  description = "Answer the webhook at once and create runner VMs in the background (pins the manager's CPU as always allocated, which it already is by default)"
   type        = bool
   default     = true
 }

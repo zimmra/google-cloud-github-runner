@@ -28,7 +28,9 @@ module "cloud_run_github_runners_manager" {
         }
         startup_cpu_boost = false # We do not scale to zero.
         # Background provisioning runs after the webhook has answered, so it needs CPU outside requests.
-        cpu_idle = !var.github_runners_manager_async_provisioning
+        # Unset (null) already means CPU always allocated here, because resource limits are set; it is
+        # pinned for background provisioning so a provider default change cannot throttle it.
+        cpu_idle = var.github_runners_manager_async_provisioning ? false : null
       }
       env = {
         GOOGLE_CLOUD_PROJECT = var.project_id
