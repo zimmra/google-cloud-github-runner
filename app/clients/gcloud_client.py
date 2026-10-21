@@ -21,6 +21,10 @@ ZONE_CACHE_SECONDS = 600
 ZONE_LABEL = 'gha-zone'
 # Instance label that records whether the VM runs as Spot or on demand (standard).
 PROVISIONING_LABEL = 'gha-provisioning'
+# Instance label that records the workflow job a VM was created for.
+JOB_LABEL = 'gha-job-id'
+# Instance statuses of a VM that is, or is about to be, a runner.
+LIVE_STATUSES = ('PROVISIONING', 'STAGING', 'RUNNING')
 
 # Operation error codes that mean "this zone cannot serve the request right now".
 # https://cloud.google.com/compute/docs/troubleshooting/troubleshooting-vm-creation
@@ -253,6 +257,7 @@ class GCloudClient:
         template_name,
         instance_label=None,
         delivery_id=None,
+        job_id=None,
     ):
         """
         Create a new GCE instance for a GitHub Actions runner.
@@ -311,6 +316,9 @@ class GCloudClient:
                 "gha-repo": repo.lower(),
                 "gha-runner": template_name
             }
+        if job_id is not None:
+            # Lets a retried provisioning task see that this job already has a VM.
+            labels[JOB_LABEL] = str(int(job_id))
 
         # Set metadata (startup script) - use shlex.quote to prevent command injection
         runner_group_flag = ""
@@ -569,6 +577,24 @@ class GCloudClient:
                 if instance.name == instance_name:
                     zone = str(getattr(instance, 'zone', '') or '').rstrip('/').split('/')[-1]
                     return zone or str(zone_key).split('/')[-1]
+        return None
+
+    def find_live_instance_for_job(self, job_id):
+        """
+        The name of a live VM already created for ``job_id``, in any zone, or None.
+
+        Raises:
+            Exception: if the aggregated list call itself fails.
+        """
+        # https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/aggregatedList
+        request = compute_v1.AggregatedListInstancesRequest(
+            project=self.project_id,
+            filter=f'labels.{JOB_LABEL} = "{int(job_id)}"',
+        )
+        for _, scoped_list in self.instance_client.aggregated_list(request=request):
+            for instance in getattr(scoped_list, 'instances', None) or []:
+                if str(getattr(instance, 'status', '')) in LIVE_STATUSES:
+                    return instance.name
         return None
 
     def delete_runner_instance(self, instance_name, delivery_id=None, zone=None):

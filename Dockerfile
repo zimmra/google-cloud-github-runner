@@ -41,7 +41,7 @@ ENV PORT=8080
 # --threads: Number of threads per worker
 # --timeout: Timeout for worker processes
 # Source: https://cloud.google.com/run/docs/tips/python#optimize_gunicorn
-ENV GUNICORN_CMD_ARGS="--bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 0"
+ENV GUNICORN_CMD_ARGS="--bind 0.0.0.0:$PORT --workers 1 --threads 16 --timeout 0"
 
 # Configure Flask application settings
 # FLASK_ENV: Set the environment to production

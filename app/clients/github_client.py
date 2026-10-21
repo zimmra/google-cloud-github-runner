@@ -79,6 +79,30 @@ class GitHubClient:
         # The installation access token will expire after 1 hour.
         return response.json()['token']
 
+    def get_workflow_job_status(self, repo_name, job_id):
+        """
+        The status of one workflow job ('queued', 'in_progress', 'completed', ...).
+
+        Returns:
+            str or None: the status, or None when GitHub does not know the job (404).
+
+        Raises:
+            requests.HTTPError: any other failed response.
+        """
+        # https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
+        token = self.get_installation_access_token()
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+        }
+        url = f"https://api.github.com/repos/{repo_name}/actions/jobs/{int(job_id)}"
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json().get('status')
+
     def get_registration_token(self, org_name=None, repo_name=None, delivery_id=None):
         """Gets a runner registration token."""
         # https://docs.github.com/en/rest/actions/self-hosted-runners
