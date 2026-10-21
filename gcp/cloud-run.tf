@@ -15,7 +15,7 @@ data "google_artifact_registry_docker_image" "container-image-github-runners-man
 module "cloud_run_github_runners_manager" {
   source     = "git::https://github.com/GoogleCloudPlatform/cloud-foundation-fabric//modules/cloud-run-v2?ref=v53.0.0"
   project_id = module.project.project_id
-  name       = "github-runners-manager-${local.region_shortnames[var.region]}"
+  name       = local.github_runners_manager_name
   type       = "SERVICE"
   region     = var.region
   containers = {
@@ -26,11 +26,15 @@ module "cloud_run_github_runners_manager" {
           cpu    = "1000m"
           memory = "512Mi"
         }
-        startup_cpu_boost = false # We do not scale to zero.
-        # Background provisioning runs after the webhook has answered, so it needs CPU outside requests.
-        # Unset (null) already means CPU always allocated here, because resource limits are set; it is
-        # pinned for background provisioning so a provider default change cannot throttle it.
-        cpu_idle = var.github_runners_manager_async_provisioning ? false : null
+        # With Cloud Tasks the service scales to zero and bills CPU only during requests, so a cold
+        # start gets extra CPU. Without it, background provisioning needs CPU outside requests: unset
+        # (null) already means always allocated here, because resource limits are set; it is pinned
+        # so a provider default change cannot throttle it.
+        startup_cpu_boost = var.github_runners_manager_cloud_tasks
+        cpu_idle = (
+          var.github_runners_manager_cloud_tasks ? true :
+          var.github_runners_manager_async_provisioning ? false : null
+        )
       }
       env = {
         GOOGLE_CLOUD_PROJECT = var.project_id
@@ -38,7 +42,11 @@ module "cloud_run_github_runners_manager" {
         GITHUB_RUNNER_GROUP  = var.github_runner_group
         # Wait for each VM insert, fall back across the region's zones, then from Spot to on-demand.
         GCE_SPOT_FALLBACK_STANDARD = tostring(var.github_runners_spot_fallback_standard)
-        ASYNC_PROVISIONING         = tostring(var.github_runners_manager_async_provisioning)
+        ASYNC_PROVISIONING         = tostring(var.github_runners_manager_async_provisioning && !var.github_runners_manager_cloud_tasks)
+        # Cloud Tasks handoff; empty values turn it off.
+        PROVISION_QUEUE         = var.github_runners_manager_cloud_tasks ? google_cloud_tasks_queue.github-runners-provision.id : ""
+        MANAGER_URL             = var.github_runners_manager_cloud_tasks ? local.github_runners_manager_url : ""
+        PROVISION_INVOKER_EMAIL = var.github_runners_manager_cloud_tasks ? module.service-account-github-runners-provisioner.email : ""
       }
       env_from_key = {
         GITHUB_APP_ID = {
@@ -73,9 +81,14 @@ module "cloud_run_github_runners_manager" {
     # The first generation with faster cold starts is still too slow for our webhook.
     gen2_execution_environment = true
     scaling = {
-      min_instance_count = var.github_runners_manager_min_instance_count # Min. 1, we do not scale to zero.
+      # With Cloud Tasks the webhook only enqueues, so a cold start fits GitHub's timeout.
+      min_instance_count = var.github_runners_manager_cloud_tasks ? 0 : var.github_runners_manager_min_instance_count
       max_instance_count = var.github_runners_manager_max_instance_count
     }
+  }
+  revision = {
+    # A provisioning task waits for inserts across zones; Cloud Tasks allows it up to 30 minutes.
+    timeout = "1800s"
   }
   service_account_config = {
     create = false

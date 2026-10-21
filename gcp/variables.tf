@@ -5,6 +5,7 @@ variable "apis" {
   default = [
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
+    "cloudtasks.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "compute.googleapis.com",
     "iam.googleapis.com",
@@ -85,7 +86,7 @@ variable "github_runners_internal_cidr" {
 # https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks#respond-within-10-seconds
 # Therefore, we always have to have one instance running and cannot scale to 0.
 variable "github_runners_manager_min_instance_count" {
-  description = "GitHub Actions Runners manager app min. instance count (a minimum of one Cloud Run instance is required to avoid GitHub webhook timeout!)"
+  description = "GitHub Actions Runners manager app min. instance count (a minimum of one Cloud Run instance is required to avoid GitHub webhook timeout!). Ignored with github_runners_manager_cloud_tasks, which scales to zero."
   type        = number
   default     = 1
 
@@ -104,6 +105,35 @@ variable "github_runners_manager_max_instance_count" {
   validation {
     condition     = var.github_runners_manager_max_instance_count >= var.github_runners_manager_min_instance_count
     error_message = "Maximum instance count must be larger than or equal to github_runners_manager_min_instance_count."
+  }
+}
+
+# Hand VM creation to a Cloud Tasks queue so the manager can scale to zero
+variable "github_runners_manager_cloud_tasks" {
+  description = "Enqueue one Cloud Tasks task per queued job instead of creating the VM in the webhook: the manager scales to zero with request-based billing, and capacity and quota errors are retried"
+  type        = bool
+  default     = true
+}
+
+variable "github_runners_provision_max_concurrent" {
+  description = "Most provisioning tasks the Cloud Tasks queue runs at once"
+  type        = number
+  default     = 6
+
+  validation {
+    condition     = var.github_runners_provision_max_concurrent >= 1 && var.github_runners_provision_max_concurrent <= 16
+    error_message = "Use between 1 and 16 concurrent provisioning tasks (the manager serves 16 threads)."
+  }
+}
+
+variable "github_runners_provision_retry_seconds" {
+  description = "How long the Cloud Tasks queue keeps retrying a job's VM creation (each attempt first checks the job is still queued)"
+  type        = number
+  default     = 3600
+
+  validation {
+    condition     = var.github_runners_provision_retry_seconds >= 60
+    error_message = "Retry for at least 60 seconds."
   }
 }
 
