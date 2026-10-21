@@ -34,6 +34,7 @@ module "github-runners-vm-templates" {
   }
 
   options = {
+    spot               = each.value.spot
     termination_action = "DELETE"
     # https://docs.github.com/en/actions/reference/limits#existing-system-limits
     max_run_duration = {

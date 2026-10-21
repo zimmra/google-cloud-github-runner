@@ -27,11 +27,16 @@ module "cloud_run_github_runners_manager" {
           memory = "512Mi"
         }
         startup_cpu_boost = false # We do not scale to zero.
+        # Background provisioning runs after the webhook has answered, so it needs CPU outside requests.
+        cpu_idle = !var.github_runners_manager_async_provisioning
       }
       env = {
         GOOGLE_CLOUD_PROJECT = var.project_id
         GOOGLE_CLOUD_ZONE    = "${var.region}-${var.zone}"
         GITHUB_RUNNER_GROUP  = var.github_runner_group
+        # Wait for each VM insert, fall back across the region's zones, then from Spot to on-demand.
+        GCE_SPOT_FALLBACK_STANDARD = tostring(var.github_runners_spot_fallback_standard)
+        ASYNC_PROVISIONING         = tostring(var.github_runners_manager_async_provisioning)
       }
       env_from_key = {
         GITHUB_APP_ID = {

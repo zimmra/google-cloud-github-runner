@@ -107,6 +107,20 @@ variable "github_runners_manager_max_instance_count" {
   }
 }
 
+# Fall back from Spot to on-demand VMs when no zone of the region has Spot capacity
+variable "github_runners_spot_fallback_standard" {
+  description = "Create an on-demand VM when no zone of the region has Spot capacity for a Spot runner type"
+  type        = bool
+  default     = true
+}
+
+# Create runner VMs in the background so the webhook answers GitHub within its 10 second timeout
+variable "github_runners_manager_async_provisioning" {
+  description = "Answer the webhook at once and create runner VMs in the background (keeps the manager's CPU allocated outside requests, which Cloud Run bills as instance-based)"
+  type        = bool
+  default     = true
+}
+
 # Maximum runtime for GitHub Actions runner VMs before Compute Engine force-deletes them
 variable "github_runners_max_run_duration" {
   description = "Maximum runtime in seconds for GitHub Actions runner VMs before termination"
@@ -230,6 +244,8 @@ variable "github_runners_types" {
     disk_provisioned_throughput = number
     image                       = string
     arch                        = string
+    # Spot VMs: much cheaper, may be preempted (the job then fails and needs a re-run).
+    spot = optional(bool, false)
   }))
   # Similar to https://docs.github.com/en/enterprise-cloud@latest/actions/reference/runners/larger-runners
   default = [
