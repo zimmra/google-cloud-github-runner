@@ -6,10 +6,16 @@ import logging
 import os
 import re
 import threading
-from app.clients import GitHubClient, GCloudClient
+from app.clients import GitHubClient, GCloudClient, TasksClient
 
 logger = logging.getLogger(__name__)
 
+REPO_URL_PATTERN = re.compile(r'^https://github\.com/[\w\-\.]+/[\w\-\.]+$')
+OWNER_URL_PATTERN = re.compile(r'^https://github\.com/[\w\-\.]+$')
+REPO_NAME_PATTERN = re.compile(r'^[\w\-\.]+/[\w\-\.]+$')
+
+# With a Cloud Tasks queue configured (PROVISION_QUEUE) the webhook only enqueues one task per job
+# and the task creates the VM (see provision_from_task). Otherwise:
 # With ASYNC_PROVISIONING=true the webhook answers GitHub at once and creates the runner VM in a
 # background thread. Creating a VM now waits for the insert operation (and may fall back across
 # zones), which takes longer than GitHub's 10 second webhook timeout. Cloud Run must then keep
@@ -46,6 +52,7 @@ class WebhookService:
         """Initialize WebhookService with API clients."""
         self.github_client = GitHubClient()
         self.gcloud_client = GCloudClient()
+        self.tasks_client = TasksClient()
 
     def _validate_payload(self, payload):
         """Validate webhook payload structure and content."""
@@ -88,6 +95,7 @@ class WebhookService:
         repo_name = payload.get('repository', {}).get('full_name')
         repo_owner_url = payload.get('repository', {}).get('owner', {}).get('html_url')
         org_name = payload.get('organization', {}).get('login')
+        job_id = workflow_job.get('id')
 
         # Sanitize log output - don't log full payload
         logger.info(
@@ -111,6 +119,27 @@ class WebhookService:
                     template_name,
                     delivery_id,
                 )
+                if self.tasks_client.enabled and isinstance(job_id, int):
+                    task_payload = {
+                        'job_id': job_id,
+                        'template_name': template_name,
+                        'repo_url': repo_url,
+                        'repo_owner_url': repo_owner_url,
+                        'repo_name': repo_name,
+                        'org_name': org_name,
+                        'delivery_id': delivery_id,
+                    }
+                    try:
+                        outcome = self.tasks_client.enqueue_provision(task_payload, job_id, delivery_id=delivery_id)
+                        return {'action': outcome, 'runner_name': None}
+                    except Exception as e:
+                        # Better a runner created here than none: fall through to direct provisioning.
+                        logger.error(
+                            "Could not enqueue provisioning for job %s (%s); provisioning directly, delivery_id: %s",
+                            job_id,
+                            e,
+                            delivery_id,
+                        )
                 if async_provisioning_enabled():
                     _provisioning_executor().submit(
                         self._provision_in_background,
@@ -149,6 +178,59 @@ class WebhookService:
 
         return {'action': 'ignored', 'runner_name': None}
 
+    def provision_from_task(self, payload):
+        """
+        Create the runner VM for one queued job, as asked by a Cloud Tasks task.
+
+        Every attempt (the first and each retry) first checks that the job still needs a VM: a job
+        that is no longer queued, or that already has a live VM, is skipped. So retries after a
+        stockout, a quota error or a timed-out wait never leave a second runner behind.
+
+        Returns:
+            dict: {'action': 'created' | 'skipped', 'runner_name': str or None, 'reason': str}.
+
+        Raises:
+            ValueError: the payload is malformed (not worth retrying).
+            ZoneCapacityError, QuotaExceededError, InstanceCreationError, Exception: retry later.
+        """
+        job_id = payload.get('job_id')
+        template_name = payload.get('template_name')
+        repo_url = payload.get('repo_url')
+        repo_owner_url = payload.get('repo_owner_url')
+        repo_name = payload.get('repo_name')
+        org_name = payload.get('org_name')
+        delivery_id = payload.get('delivery_id')
+        if not isinstance(job_id, int) or not isinstance(template_name, str) or not template_name:
+            raise ValueError("job_id and template_name are required")
+        if not isinstance(repo_name, str) or not REPO_NAME_PATTERN.match(repo_name):
+            raise ValueError("Invalid repository name")
+        if repo_url and not REPO_URL_PATTERN.match(repo_url):
+            raise ValueError("Invalid repository URL format")
+        if repo_owner_url and not OWNER_URL_PATTERN.match(repo_owner_url):
+            raise ValueError("Invalid repository owner URL format")
+
+        existing = self.gcloud_client.find_live_instance_for_job(job_id)
+        if existing:
+            logger.info("Job %s already has VM %s; skipping, delivery_id: %s", job_id, existing, delivery_id)
+            return {'action': 'skipped', 'runner_name': existing, 'reason': 'vm exists'}
+        try:
+            status = self.github_client.get_workflow_job_status(repo_name, job_id)
+        except Exception as e:
+            # Unknown is not "done": provisioning a runner nobody uses costs less than a stuck job.
+            logger.warning("Could not read job %s status (%s); provisioning anyway, delivery_id: %s",
+                           job_id, e, delivery_id)
+            status = 'queued'
+        if status != 'queued':
+            logger.info("Job %s is %s, no longer queued; skipping, delivery_id: %s", job_id, status, delivery_id)
+            return {'action': 'skipped', 'runner_name': None, 'reason': f'job {status}'}
+
+        instance_name = self._handle_queued_job(
+            template_name, repo_url, repo_owner_url, repo_name, org_name, delivery_id=delivery_id, job_id=job_id
+        )
+        if instance_name is None:
+            return {'action': 'skipped', 'runner_name': None, 'reason': 'no matching template'}
+        return {'action': 'created', 'runner_name': instance_name, 'reason': ''}
+
     def _handle_queued_job(
         self,
         template_name,
@@ -157,6 +239,7 @@ class WebhookService:
         repo_name,
         org_name,
         delivery_id=None,
+        job_id=None,
     ):
         """Handle queued workflow job.
 
@@ -176,6 +259,7 @@ class WebhookService:
                     template_name,
                     repo_name,
                     delivery_id=delivery_id,
+                    **({'job_id': job_id} if job_id is not None else {}),
                 )
             elif repo_name:
                 # Create GitHub Actions runner instance for repository
@@ -183,7 +267,12 @@ class WebhookService:
                     repo_name=repo_name, delivery_id=delivery_id
                 )
                 return self.gcloud_client.create_runner_instance(
-                    token, repo_url, template_name, repo_name, delivery_id=delivery_id
+                    token,
+                    repo_url,
+                    template_name,
+                    repo_name,
+                    delivery_id=delivery_id,
+                    **({'job_id': job_id} if job_id is not None else {}),
                 )
             else:
                 logger.error(
