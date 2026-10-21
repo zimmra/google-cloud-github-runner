@@ -1,11 +1,42 @@
 """
 Service for processing webhook events.
 """
+import concurrent.futures
 import logging
+import os
 import re
+import threading
 from app.clients import GitHubClient, GCloudClient
 
 logger = logging.getLogger(__name__)
+
+# With ASYNC_PROVISIONING=true the webhook answers GitHub at once and creates the runner VM in a
+# background thread. Creating a VM now waits for the insert operation (and may fall back across
+# zones), which takes longer than GitHub's 10 second webhook timeout. Cloud Run must then keep
+# CPU allocated outside requests (cpu_idle = false), or the background work is throttled.
+ASYNC_PROVISIONING_ENV = 'ASYNC_PROVISIONING'
+PROVISIONING_WORKERS_ENV = 'PROVISIONING_WORKERS'
+DEFAULT_PROVISIONING_WORKERS = 8
+
+_executor = None
+_executor_lock = threading.Lock()
+
+
+def async_provisioning_enabled():
+    """True when queued jobs are provisioned in the background."""
+    return os.environ.get(ASYNC_PROVISIONING_ENV, 'false').lower() == 'true'
+
+
+def _provisioning_executor():
+    """The process-wide thread pool that creates runner VMs in the background."""
+    global _executor
+    with _executor_lock:
+        if _executor is None:
+            workers = int(os.environ.get(PROVISIONING_WORKERS_ENV, DEFAULT_PROVISIONING_WORKERS))
+            _executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix='provision'
+            )
+        return _executor
 
 
 class WebhookService:
@@ -80,6 +111,17 @@ class WebhookService:
                     template_name,
                     delivery_id,
                 )
+                if async_provisioning_enabled():
+                    _provisioning_executor().submit(
+                        self._provision_in_background,
+                        template_name,
+                        repo_url,
+                        repo_owner_url,
+                        repo_name,
+                        org_name,
+                        delivery_id,
+                    )
+                    return {'action': 'accepted', 'runner_name': None}
                 instance_name = self._handle_queued_job(
                     template_name,
                     repo_url,
@@ -156,6 +198,32 @@ class WebhookService:
                 "Failed to spawn runner: %s, delivery_id: %s", str(e), delivery_id
             )
             raise
+
+    def _provision_in_background(
+        self, template_name, repo_url, repo_owner_url, repo_name, org_name, delivery_id=None
+    ):
+        """Create the runner VM off the request thread; a failure is logged, never raised."""
+        try:
+            instance_name = self._handle_queued_job(
+                template_name,
+                repo_url,
+                repo_owner_url,
+                repo_name,
+                org_name,
+                delivery_id=delivery_id,
+            )
+            logger.info(
+                "Background provisioning finished, runner_name: %s, delivery_id: %s",
+                instance_name,
+                delivery_id,
+            )
+        except Exception as e:
+            # _handle_queued_job already logged the cause; this marks the job as left queued.
+            logger.error(
+                "Background provisioning failed; the job stays queued: %s, delivery_id: %s",
+                e,
+                delivery_id,
+            )
 
     def _handle_completed_job(self, workflow_job, delivery_id=None):
         """Handle completed workflow job.

@@ -430,3 +430,66 @@ class TestWebhookServiceDeliveryIdLogging:
         mock_gh_client.get_registration_token.assert_called_once_with(
             repo_name="owner/repo", delivery_id="fwd-gh-001"
         )
+
+
+class TestAsyncProvisioning:
+    """ASYNC_PROVISIONING answers the webhook at once and creates the VM in the background."""
+
+    PAYLOAD = {
+        'action': 'queued',
+        'workflow_job': {'labels': ['gcp-ubuntu-24.04']},
+        'repository': {'html_url': 'https://github.com/owner/repo', 'full_name': 'owner/repo'},
+    }
+
+    @pytest.fixture
+    def immediate_executor(self, monkeypatch):
+        """Run submitted work inline so the test can observe it deterministically."""
+        from app.services import webhook_service
+
+        class Inline:
+            def submit(self, fn, *args, **kwargs):
+                fn(*args, **kwargs)
+
+        monkeypatch.setenv(webhook_service.ASYNC_PROVISIONING_ENV, 'true')
+        monkeypatch.setattr(webhook_service, '_provisioning_executor', lambda: Inline())
+
+    @patch('app.services.webhook_service.GCloudClient')
+    @patch('app.services.webhook_service.GitHubClient')
+    def test_queued_job_is_accepted_and_provisioned_in_the_background(
+        self, mock_gh_client_class, mock_gc_client_class, immediate_executor
+    ):
+        mock_gh_client_class.return_value.get_registration_token.return_value = 'tok'
+        mock_gc_client_class.return_value.create_runner_instance.return_value = 'gcp-runner-x'
+
+        result = WebhookService().handle_workflow_job(self.PAYLOAD, delivery_id='d-1')
+
+        assert result == {'action': 'accepted', 'runner_name': None}
+        mock_gc_client_class.return_value.create_runner_instance.assert_called_once_with(
+            'tok', 'https://github.com/owner/repo', 'gcp-ubuntu-24.04', 'owner/repo', delivery_id='d-1'
+        )
+
+    @patch('app.services.webhook_service.GCloudClient')
+    @patch('app.services.webhook_service.GitHubClient')
+    def test_background_failure_is_logged_not_raised(
+        self, mock_gh_client_class, mock_gc_client_class, immediate_executor, caplog
+    ):
+        mock_gh_client_class.return_value.get_registration_token.return_value = 'tok'
+        mock_gc_client_class.return_value.create_runner_instance.side_effect = RuntimeError('no zone')
+
+        with caplog.at_level(logging.ERROR):
+            result = WebhookService().handle_workflow_job(self.PAYLOAD, delivery_id='d-2')
+
+        assert result['action'] == 'accepted'
+        assert any('stays queued' in r.message and 'd-2' in r.message for r in caplog.records)
+
+    @patch('app.services.webhook_service.GCloudClient')
+    @patch('app.services.webhook_service.GitHubClient')
+    def test_synchronous_by_default(self, mock_gh_client_class, mock_gc_client_class, monkeypatch):
+        from app.services import webhook_service
+        monkeypatch.delenv(webhook_service.ASYNC_PROVISIONING_ENV, raising=False)
+        mock_gh_client_class.return_value.get_registration_token.return_value = 'tok'
+        mock_gc_client_class.return_value.create_runner_instance.return_value = 'gcp-runner-y'
+
+        result = WebhookService().handle_workflow_job(self.PAYLOAD, delivery_id='d-3')
+
+        assert result == {'action': 'created', 'runner_name': 'gcp-runner-y'}
