@@ -73,6 +73,8 @@ module "cloud_run_github_runners_manager" {
     }
   }
   service_config = {
+    # A provisioning task waits for inserts across zones; Cloud Tasks allows it up to 30 minutes.
+    timeout = "1800s"
     # Disable IAM permission check
     # There should be no requirement to pass the roles/run.invoker to the IAM block to enable public access.
     # This allows for the org policy domain restricted sharing org policy remain enabled.
@@ -85,10 +87,6 @@ module "cloud_run_github_runners_manager" {
       min_instance_count = var.github_runners_manager_cloud_tasks ? 0 : var.github_runners_manager_min_instance_count
       max_instance_count = var.github_runners_manager_max_instance_count
     }
-  }
-  revision = {
-    # A provisioning task waits for inserts across zones; Cloud Tasks allows it up to 30 minutes.
-    timeout = "1800s"
   }
   service_account_config = {
     create = false
